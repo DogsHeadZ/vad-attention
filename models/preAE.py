@@ -122,7 +122,7 @@ class Decoder(torch.nn.Module):
     
 
 class PreAE(torch.nn.Module):
-    def __init__(self, n_channel =3,  t_length = 5, memory_size = 10, feature_dim = 512, key_dim = 512, temp_update = 0.1, temp_gather=0.1):
+    def __init__(self, n_channel =3,  t_length = 5):
         super(PreAE, self).__init__()
 
         self.encoder = Encoder(t_length, n_channel)
