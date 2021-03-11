@@ -6,6 +6,7 @@ from torch.optim import lr_scheduler
 from .convlstm import ConvLSTM
 
 
+
 ###############################################################################
 # Helper Functions
 ###############################################################################
@@ -156,6 +157,8 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9)
     elif netG == 'resnet_6blocks':
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6)
+    elif netG == 'resnet_6blocks_attention':
+        net = ResnetAttentionGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6)
     elif netG == 'unet_128':
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_256':
@@ -317,6 +320,131 @@ def cal_gradient_penalty(netD, real_data, fake_data, device, type='mixed', const
         return gradient_penalty, gradients
     else:
         return 0.0, None
+
+class ResnetAttentionGenerator(nn.Module):
+    """Resnet-based generator that consists of Resnet blocks between a few downsampling/upsampling operations.
+
+    We adapt Torch code and idea from Justin Johnson's neural style transfer project(https://github.com/jcjohnson/fast-neural-style)
+    """
+
+    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6,
+                 padding_type='reflect', step=4):
+        """Construct a Resnet-based generator
+
+        Parameters:
+            input_nc (int)      -- the number of channels in input images
+            output_nc (int)     -- the number of channels in output images
+            ngf (int)           -- the number of filters in the last conv layer
+            norm_layer          -- normalization layer
+            use_dropout (bool)  -- if use dropout layers
+            n_blocks (int)      -- the number of ResNet blocks
+            padding_type (str)  -- the name of padding layer in conv layers: reflect | replicate | zero
+        """
+        assert (n_blocks >= 0)
+        super(ResnetAttentionGenerator, self).__init__()
+        if type(norm_layer) == functools.partial:
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        model = [nn.ReflectionPad2d(3),
+                 nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
+                 norm_layer(ngf),
+                 nn.ReLU(True)]
+
+        n_downsampling = 2
+        for i in range(n_downsampling):  # add downsampling layers
+            mult = 2 ** i
+            model += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
+                      norm_layer(ngf * mult * 2),
+                      nn.ReLU(True)]
+
+        mult = 2 ** n_downsampling
+        for i in range(n_blocks):  # add ResNet blocks
+
+            model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout,
+                                  use_bias=use_bias)]
+
+        self.recurrent_model = ConvLSTM(input_dim=ngf * mult,
+                                   hidden_dim=[ngf * mult, ngf * mult, ngf * mult],
+                                   kernel_size=(3, 3),
+                                   num_layers=3,
+                                   batch_first=True,
+                                   bias=True,
+                                   return_all_layers=False)
+
+        de_model = [nn.Conv2d(step * ngf * mult, ngf * mult, kernel_size=3, padding=1, bias=use_bias),
+                    norm_layer(ngf * mult),
+                    nn.ReLU(True)]
+
+        for i in range(n_downsampling):  # add upsampling layers
+            mult = 2 ** (n_downsampling - i)
+            de_model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2),
+                                            kernel_size=3, stride=2,
+                                            padding=1, output_padding=1,
+                                            bias=use_bias),
+                         norm_layer(int(ngf * mult / 2)),
+                         nn.ReLU(True)]
+        de_model += [nn.ReflectionPad2d(3)]
+        de_model += [nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0)]
+        de_model += [nn.Tanh()]
+
+        self.model = nn.Sequential(*model)
+        self.de_model = nn.Sequential(*de_model)
+
+        # TODO
+        # generate attention 
+        self.attention_meta_learner = nn.Sequential(nn.Linear(4096, 4096), nn.Sigmoid()) # 这里代表整个网络的frame输入尺寸为256*256
+    
+    def get_attention(self, f, b):
+        # calc <f,b>
+        attention = []
+        for i in range(b.shape[0]):
+            bi = b[i]
+            # cosine_matrix = torch.cosine_similarity(f, bi, dim=0)
+            f = f/torch.norm(f, dim=0, p=2)
+            bi = bi/torch.norm(bi, dim=0, p=2)
+            cosine_matrix = f.t().mm(bi)
+            # print("cosine_matrix.shape: ", cosine_matrix.shape)
+            p = torch.nn.functional.avg_pool1d(cosine_matrix.unsqueeze(0), kernel_size=cosine_matrix.shape[1], stride=None)
+            # print("p.shape： ", p.shape)            
+            w = self.attention_meta_learner(p.view(4096))
+            # print("w.shape: ", w.shape)            
+            attention.append(w.view(64, 64))       
+                
+        attention_map = torch.stack(attention, 0)
+        attention_map = torch.mean(attention_map, 0)
+        # print("attention_map.shape: ", attention_map.shape)
+        return attention_map
+
+    def forward(self, frames, objects):    # frames/objects: N x T x c x h x w
+
+        T = frames.shape[1]
+        frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
+        objects = objects.reshape(-1, objects.shape[-3], objects.shape[-2], objects.shape[-1])
+
+        f = self.model(frames)    # f: (N * T) x (ngf * 2 ** n_downsampling) x h' x w'
+        ft = f[int(T/2)].view(f.shape[1], -1)   # c*d1
+        # print("f.shape: {}, ft.shape: {}".format(f.shape, ft.shape))
+
+        b = self.model(objects)
+        b_view = b.view(b.shape[0], b.shape[1], -1)
+        # print("b.shape: {}, bview.shape: {}".format(b.shape, b_view.shape))
+
+        # TODO get_attention
+        attention_map = self.get_attention(ft,b_view)
+        z = attention_map * f
+
+        # print("z.shape: ", z.shape)
+        
+        z = z.reshape(-1, T, z.shape[-3], z.shape[-2], z.shape[-1])
+        out_recurrent,_ = self.recurrent_model(z)
+        out_recurrent = out_recurrent[0].reshape(out_recurrent[0].shape[0], -1, out_recurrent[0].shape[-2], out_recurrent[0].shape[-1])
+        # print("out_recurrent.shape: ", out_recurrent.shape)
+        out = self.de_model(out_recurrent)
+        # print(out.shape)
+
+        return out
 
 
 class ResnetGenerator(nn.Module):
@@ -650,3 +778,4 @@ class PixelDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.net(input)
+
